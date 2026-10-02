@@ -2,13 +2,18 @@
 
 ![BeeLlama.cpp logo](beellama.jpg)
 
-BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing more speed and context out of local GGUF inference. It adds variance-normalized KV-cache quantization (KVarN), KV cache precision tail for recent tokens, low-bit cache types, adaptive draft control for speculative decoding, reasoning-loop protection, GPU-resident MoE expert caching with prefill routing hooks, single-pass constrained decisions over text and images, and the Maple MoE architecture.
+BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing more speed and context out of local GGUF inference. It adds variance-normalized KV-cache quantization (KVarN), KV cache precision tail for recent tokens, low-bit cache types, adaptive draft control for speculative decoding, reasoning-loop protection, and more.
 
 > Not quite a pegasus, but close enough.
 
 [![Support my work!](https://anbeeld.com/images/support.jpg)](https://anbeeld.com/support)
 
-## Fork Features
+This repository is a fork of [Anbeeld/beellama.cpp](https://github.com/Anbeeld/beellama.cpp). Everything in
+[BeeLlama features](#beellama-features-from-anbeeld) is Anbeeld's work and unchanged here; the merge this fork
+contributes is listed under [What this fork adds](#what-this-fork-adds) — a GPU-resident MoE expert cache, Qwen
+prefill routing hooks, single-pass constrained decisions over text and images, and the Maple architecture.
+
+## BeeLlama features (from Anbeeld)
 
 - **Variance-normalized KV-cache quantization (KVarN)**: provides higher precision at similar memory costs. Independent K and V bit widths at `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and `kvarn8`, set with `--cache-type-k` and `--cache-type-v`. Supports 64-, 128-, 256-, and 512-dimensional K/V heads.
 - **KV cache precision tail**: keep most of the KV cache quantized while storing recent tokens in F16/BF16, enabled with `--kv-tail-tokens`. A single global softmax merges the quantized body and the precision tail under FlashAttention, without materializing the whole cache.
@@ -18,15 +23,23 @@ BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing
 - **Adaptive draft-max for DFlash**: adjusts the active draft horizon at runtime instead of using a fixed `--spec-draft-n-max`, comparing speculative throughput against a no-spec baseline.
 - **Reasoning-loop protection**: the server detects repeated hidden reasoning and visible output, forcing reasoning to close or stopping generation when a loop triggers.
 - **Reworked KV cache and prompt reuse**: transactional state restore, capability-aware speculative rollback, and reusable RAM snapshots. Cached prompts are selected by their safely restorable prefix.
+
+For the full feature and public-repo comparison, read [docs/beellama-features.md](docs/beellama-features.md). For the complete argument reference, read [docs/beellama-args.md](docs/beellama-args.md).
+
+## What this fork adds
+
 - **MoE expert cache**: `--moe-cache-profile` and `--moe-cache-slots` keep the most frequently routed experts of CPU-offloaded MoE layers resident in GPU memory as per-layer packs, folding every cold expert id onto one zeroed slot so routing stays backend-agnostic. `llama-moe-trace` records the routing profile (`pos,layer,id0,...`) that selects the hot set, and `tools/moe-trace/simulate.py` scores candidate memory budgets before a slot count is committed.
 - **Prefill routing hooks for MoE**: `--prefill-experts` routes fewer experts on multi-token (prefill) ubatches while decode keeps the model's native top-k. On Qwen3.5/3.6 MoE, the environment-only late-layer hooks (`LLAMA_MOE_PREFILL_SKIP_LAYER`, `LLAMA_MOE_PREFILL_SKIP_MIN_TOKENS`, `LLAMA_MOE_PREFILL_EXPERTS_USED`, `LLAMA_MOE_PROJECTOR_MODE`, `LLAMA_MOE_KV_PROJECTOR`, `LLAMA_MOE_PREFILL_ADAPTIVE`) bypass the routed FFN on late prefill layers and, with the KV projector, synthesize K/V straight into the cache instead of running the quadratic attention over the prompt.
 - **Parallel constrained decisions**: `POST /decision` in `llama-server` — and `llama-parallel-decision` from the CLI — answers a fixed JSON schema in one batched forward pass. Each field's allowed values are scored as token paths forking from a shared trunk, so all fields are answered in a single `llama_decode`, every answer carries a probability, and the assembled object always matches the schema. Enabled with `--decision-seqs`; contexts can carry images through the same `mtmd` projector as `/v1/chat/completions`.
 - **Maple-Preview architecture**: the ternary-weight 20B-A1B MoE reasoner, with its 3:1 sliding-window/gated-attention hybrid, per-head QK norm, and clamp-7 SwiGLU experts, including `conversion/maple.py` for Hugging Face to GGUF conversion.
 - **Vulkan `MUL_MAT_ID` row tiles for skewed routing**: the row-tile count is derived from `nei0 * nei1` rather than `nei1` alone, so a single expert owning an entire (slot, token) row list — the shape the expert cache produces — dispatches across every tile.
 
-These features are merged from [GenerelSchwerz/llama.cpp](https://github.com/GenerelSchwerz/llama.cpp) (`moe-cache`), [ob7282/moe-kv-projector](https://github.com/ob7282/moe-kv-projector), [graydini/llama.cpp](https://github.com/graydini/llama.cpp) (`multimodal-decision`), and [stamsam/llama.cpp](https://github.com/stamsam/llama.cpp).
-
-For the full feature and public-repo comparison, read [docs/beellama-features.md](docs/beellama-features.md). For the complete argument reference, read [docs/beellama-args.md](docs/beellama-args.md).
+The first four of these are merged from [GenerelSchwerz/llama.cpp](https://github.com/GenerelSchwerz/llama.cpp)
+(`moe-cache`), [ob7282/moe-kv-projector](https://github.com/ob7282/moe-kv-projector),
+[graydini/llama.cpp](https://github.com/graydini/llama.cpp) (`multimodal-decision`), and
+[stamsam/llama.cpp](https://github.com/stamsam/llama.cpp); the Vulkan row-tile fix was written here to make the
+expert cache dispatch correctly. Feature documentation for all of them is in the
+[Merged feature usage](#merged-feature-usage) section below and in [docs/beellama-args.md](docs/beellama-args.md).
 
 ## KV Cache Quantization
 
@@ -236,6 +249,15 @@ target cache, so configure target `--cache-type-k/v kvarn*` instead of a draft
 cache type. Unclassified or shared-cache MTP architectures reject explicit
 draft KVarN requests.
 
+### Router Mode With Presets
+
+```sh
+llama-server --models-dir /path/to/models
+llama-server --models-preset presets.ini
+```
+
+## Merged feature usage
+
 ### MoE Expert Cache
 
 With the expert cache, only the experts a model rarely routes to stay in host
@@ -277,13 +299,6 @@ probability; the JSON is assembled by code, so it always matches the schema.
 `llama-parallel-decision` runs the same engine from the CLI. See
 [tools/parallel-decision/README.md](tools/parallel-decision/README.md) for the schema
 types, image `contexts`, and the sequence budget a given architecture affords.
-
-### Router Mode With Presets
-
-```sh
-llama-server --models-dir /path/to/models
-llama-server --models-preset presets.ini
-```
 
 ## Documentation
 
