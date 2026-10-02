@@ -519,9 +519,11 @@ struct common_params {
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
+    int32_t n_seq_decision        =     0; // sequences reserved for llama-server's /decision endpoint (0 = disabled)
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t n_outputs_max_per_seq =     1; // max outputs per sequence
+    int32_t prefill_n_expert_used =    -1; // experts used during prefill (-1 = model value)
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
     int32_t n_print               =    -1; // print token count every n tokens (-1 = disabled)
@@ -647,6 +649,9 @@ struct common_params {
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
+
+    std::string moe_cache_profile = ""; // MoE expert cache routing profile CSV (empty = disabled)
+    int32_t     moe_cache_slots   = 0;  // MoE expert cache slots per layer (0 = disabled)
 
     bool single_turn       = false; // single turn chat conversation
 

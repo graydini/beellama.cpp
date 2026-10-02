@@ -312,6 +312,43 @@ configuration example.
 
 Use the same corpus, context, logical batch, and physical ubatch for both KLD legs.
 
+## MoE expert cache and prefill routing
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--moe-cache-profile FNAME` | `LLAMA_ARG_MOE_CACHE_PROFILE` (`GGML_MOE_CACHE_PROFILE`) | Unset | Routing-profile CSV produced by `llama-moe-trace` (`pos,layer,id0,...`) that chooses which routed experts become GPU-resident hot pack slots. Requires `--moe-cache-slots` and a CPU expert placement (`--n-cpu-moe` or `--cpu-moe`). |
+| `--moe-cache-slots N` | `LLAMA_ARG_MOE_CACHE_SLOTS` (`GGML_MOE_CACHE_SLOTS`) | `0` | Routed experts per layer kept resident in GPU memory. `0` disables the cache. Keep this modest: a slot count near `n_expert` builds a second near-full copy of the expert weights. |
+| `--prefill-experts N` | `LLAMA_ARG_PREFILL_EXPERTS` | Model value | Routed experts used for multi-token (prefill) ubatches. Applies only when the expert cache is inactive, because the cache hot/cold maps are shaped for the model's native top-k. Decode ubatches keep the model value. |
+
+The Qwen3.5/3.6 MoE graph additionally reads these environment-only prefill
+hooks, ported from the `moe-kv-projector` branch. They take effect only for
+ubatches larger than the skip threshold, so generation stays on the full path:
+
+| Env var | Default | Behavior |
+|---|---|---|
+| `LLAMA_MOE_PREFILL_SKIP_LAYER` | `0` (off) | From this layer onward, prefill ubatches bypass the routed MoE FFN. |
+| `LLAMA_MOE_PREFILL_SKIP_MIN_TOKENS` | `32` | Minimum ubatch size for the skip to apply. |
+| `LLAMA_MOE_PREFILL_ADAPTIVE` | off | When set, short prompts (`n_tokens < 256`) use the conservative layer-32 preset instead of the configured skip layer. |
+| `LLAMA_MOE_PREFILL_EXPERTS_USED` | unset | On skipped layers, evaluate the shared expert plus this many routed experts instead of bypassing them entirely. |
+| `LLAMA_MOE_PROJECTOR_MODE` | unset (`shared`/`1`) | On skipped layers, run the shared-expert FFN as the projector instead of a pure residual pass-through. |
+| `LLAMA_MOE_KV_PROJECTOR` | unset | On skipped full-attention layers, synthesize K/V from the layer's own QKV weights into the cache and bypass the attention computation; `moe_router` additionally gates the shared-expert projector output by the top router probability. |
+
+## Parallel constrained decisions
+
+`llama-server` answers a finite JSON schema in one batched forward pass through
+`POST /decision` (also `/v1/decision`), and `llama-parallel-decision` runs the
+same engine from the CLI. See [tools/parallel-decision/README.md](../tools/parallel-decision/README.md)
+for the request shape, schema types, and the image (`contexts` + `images`) path.
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--decision-seqs N` | `LLAMA_ARG_DECISION_SEQS` | `0` (disabled) | Sequence ids reserved above the slots for the `/decision` endpoint: one cached instruction prefix, one trunk per context, the rest for parallel branches. Minimum 3. Also forces the unified KV cache so branches share the trunk's cells, and adds one output row per branch sequence to the batch limits. |
+
+`LLAMA_DECISION_DEBUG` traces tokenization, chunk encoding, and decode on the
+`/decision` path. The engine and route are ported from
+`graydini/llama.cpp@multimodal-decision`; the multimodal path uses the same
+`mtmd` projector as `/v1/chat/completions`.
+
 ## CUDA FlashAttention build policy
 
 | Argument | Env var | Default | Behavior |

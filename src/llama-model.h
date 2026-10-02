@@ -336,6 +336,20 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps     = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
     struct ggml_tensor * ffn_gate_up_exps  = nullptr;
+
+    // MoE expert cache (hot/cold split): GPU-resident pack of the S most
+    // frequently routed experts of a CPU-offloaded MoE layer + id remap tables.
+    // Zero-slot design (backend-agnostic, no negative ids): the hot pack has
+    // S+1 experts with slot S all-zero, and the hot experts' slabs in the
+    // original CPU tensors are zeroed in place so cold ids can fold onto one
+    // shared zero slot. moe_map_hot[e] = pack slot or S; moe_map_cold[e] =
+    // global id (identity) for cold experts, or the zeroed slot for hot ones.
+    struct ggml_tensor * ffn_gate_exps_hot = nullptr;
+    struct ggml_tensor * ffn_down_exps_hot = nullptr;
+    struct ggml_tensor * ffn_up_exps_hot   = nullptr;
+    struct ggml_tensor * moe_map_hot       = nullptr; // i32[n_expert]: pack slot or zero slot S
+    struct ggml_tensor * moe_map_cold      = nullptr; // i32[n_expert]: global id or zeroed slot
+
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
     struct ggml_tensor * ffn_gate_exps_b   = nullptr;
     struct ggml_tensor * ffn_down_exps_b   = nullptr;
@@ -826,6 +840,15 @@ struct llama_model_base : public llama_model {
     void load_hparams(llama_model_loader & ml) override;
     void load_vocab  (llama_model_loader & ml) override;
     bool load_tensors(llama_model_loader & ml) override;
+
+    // GGML_MOE_CACHE_PROFILE + GGML_MOE_CACHE_SLOTS: build GPU-resident hot
+    // expert packs for CPU-offloaded MoE layers (see llama_layer::*_exps_hot)
+    void init_moe_expert_cache();
+
+    // true when moe_cache_profile + moe_cache_slots are set (either via params
+    // or env fallback). Used to force CPU weight buffers to be writable (no
+    // mmap zero-copy) because the cache zeroes hot expert slabs in place.
+    bool moe_cache_enabled() const;
 
     // model must define these
     void load_arch_hparams(llama_model_loader & ml) override = 0;

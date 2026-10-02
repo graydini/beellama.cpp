@@ -2488,7 +2488,19 @@ struct llama_model_qwen35moe : public llama_model_base {
 
         ggml_tensor * build_layer_ffn(
                     ggml_tensor * cur,
+                            int   il,
+                            int   n_experts_override = -1);
+
+        ggml_tensor * build_layer_projector_ffn(
+                    ggml_tensor * cur,
                             int   il);
+
+        void build_projected_kv(
+        llm_graph_input_attn_kv * inp,
+                    ggml_tensor * h_proj,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                            int   target_layer);
 
         ggml_tensor * build_norm_gated(
                     ggml_tensor * input,
@@ -2625,6 +2637,19 @@ struct llama_model_step35 : public llama_model_base {
 
     struct graph_mtp : public llm_graph_context {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+// Maple-Preview (DeepGrove) ternary-weight MoE reasoning LLM
+struct llama_model_maple : public llama_model_base {
+    llama_model_maple(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

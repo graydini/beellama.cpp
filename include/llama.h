@@ -381,6 +381,11 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // MoE expert cache: GPU-resident packs of the most frequently routed
+        // experts of CPU-offloaded MoE layers (hot/cold split, see llama_layer)
+        const char * moe_cache_profile; // routing profile CSV from llama-moe-trace (NULL = disabled)
+        int32_t      moe_cache_slots;   // experts cached per layer (0 = disabled)
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
@@ -449,6 +454,7 @@ extern "C" {
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
+        int32_t  prefill_n_expert_used; // experts used during prefill instead of model value, -1 = native [EXPERIMENTAL]
 
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`

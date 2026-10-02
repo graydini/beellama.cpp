@@ -11,6 +11,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "base64.hpp"
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
@@ -18,6 +19,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "decision-engine.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -39,6 +41,10 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// Toggle debug output with LLAMA_DECISION_DEBUG env var
+namespace { bool decision_debug_enabled() { static bool v = std::getenv("LLAMA_DECISION_DEBUG") != nullptr; return v; } }
+#define DECISION_DEBUG(fmt, ...) do { if (decision_debug_enabled()) { fprintf(stderr, "[decision-debug] " fmt "\n", ##__VA_ARGS__); } } while(0)
 
 static bool server_reasoning_budget_state_is_reasoning(common_reasoning_budget_state state) {
     return state == REASONING_BUDGET_COUNTING ||
@@ -77,6 +83,9 @@ static common_speculative_output_limits server_output_limits(const common_params
 
     auto result = common_speculative_get_output_limits(
             params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
+
+    // /decision scores one output row per branch sequence, all in the same ubatch
+    result.total += params.n_seq_decision;
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
@@ -992,6 +1001,7 @@ public:
 
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
+    std::unique_ptr<llama_decision::engine> decision_engine; // created by the first /decision request
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
@@ -2813,6 +2823,161 @@ private:
         return result.success;
     }
 
+    // POST /decision: answer a finite JSON schema in one batched pass on this thread.
+    // Uses the sequence ids above the slots reserved by --decision-seqs (see tools/parallel-decision).
+    json handle_decision(const json & body) {
+        if (params_base.n_seq_decision < 3) {
+            throw std::invalid_argument("decisions are disabled: start the server with --decision-seqs N (N >= 3)");
+        }
+        // one decision per context; all contexts share the schema, the instructions and the cached prefix
+        if (!body.contains("contexts") || !body.at("contexts").is_array() || body.at("contexts").empty() || body.at("contexts").size() > 256) {
+            throw std::invalid_argument("\"contexts\" must be an array of 1-256 strings");
+        }
+        // Optional: images array (base64-encoded), one per context, in the same order as contexts.
+        // An empty/null entry in images means "no image for this context".
+        // Each entry can also be an array of base64 strings for multi-image contexts.
+        std::vector<std::string> contexts;
+        std::vector<mtmd::bitmaps> context_bitmaps;
+        bool has_images = body.contains("images") && body.at("images").is_array();
+        DECISION_DEBUG("handle_decision: has_images=%d", (int)has_images);
+        if (has_images && body.at("images").size() != body.at("contexts").size()) {
+            throw std::invalid_argument("\"images\" array length must match \"contexts\" length");
+        }
+        contexts.reserve(body.at("contexts").size());
+        context_bitmaps.reserve(body.at("contexts").size());
+        for (size_t i = 0; i < body.at("contexts").size(); ++i) {
+            const auto & c = body.at("contexts")[i];
+            if (!c.is_string() || c.get<std::string>().empty()) {
+                throw std::invalid_argument("every entry of \"contexts\" must be a non-empty string");
+            }
+            std::string ctx_text = c.get<std::string>();
+            mtmd::bitmaps ctx_bitmaps;
+            if (has_images && i < body.at("images").size()) {
+                // images[i] can be a single base64 string OR an array of base64 strings
+                const auto & img_entry = body.at("images")[i];
+                std::vector<std::string> img_list;
+                if (img_entry.is_array()) {
+                    for (const auto & img : img_entry) {
+                        if (img.is_string() && !img.get<std::string>().empty()) {
+                            img_list.push_back(img.get<std::string>());
+                        }
+                    }
+                } else if (img_entry.is_string() && !img_entry.get<std::string>().empty()) {
+                    img_list.push_back(img_entry.get<std::string>());
+                }
+                for (const std::string & b64 : img_list) {
+                    DECISION_DEBUG("handle_decision: decoding image for context %zu", i);
+                    // decode base64 image
+                    std::string raw_b64 = b64;
+                    // strip optional data URL prefix: "data:image/...;base64,...."
+                    if (raw_b64.find("data:") == 0) {
+                        auto pos = raw_b64.find(",base64,");
+                        if (pos != std::string::npos) {
+                            raw_b64 = raw_b64.substr(pos + 8);
+                        } else {
+                            auto pos2 = raw_b64.find(",");
+                            if (pos2 != std::string::npos) {
+                                raw_b64 = raw_b64.substr(pos2 + 1);
+                            }
+                        }
+                    }
+                    std::string raw = base64::decode(raw_b64);
+                    DECISION_DEBUG("handle_decision: image raw size=%zu", raw.size());
+                    if (!raw.empty()) {
+                        auto out = mtmd_helper_bitmap_init_from_buf(mctx, reinterpret_cast<const unsigned char *>(raw.data()), raw.size(), false, init_opt);
+                        DECISION_DEBUG("handle_decision: bitmap init result.bitmap=%p", (void*)out.bitmap);
+                        if (out.bitmap) {
+                            ctx_bitmaps.entries.emplace_back(out.bitmap);
+                        } else {
+                            throw std::runtime_error("failed to decode image at context " + std::to_string(i));
+                        }
+                    }
+                }
+            }
+            if (!ctx_bitmaps.entries.empty()) {
+                // Media markers should already be in the context text at this point.
+                // If the context text doesn't contain any media markers, prepend them
+                // (backward compatibility with single-image contexts).
+                // The harness can now include media markers inline in context text
+                // for multi-image contexts where image order matters relative to text.
+                const char * marker = mctx ? mtmd_get_marker(mctx) : nullptr;
+                if (marker && ctx_text.find(marker) == std::string::npos) {
+                    // No media markers in text, so prepend them (legacy behavior)
+                    std::string markers;
+                    for (size_t j = 0; j < ctx_bitmaps.entries.size(); ++j) {
+                        markers += marker;
+                    }
+                    ctx_text = markers + ctx_text;
+                    DECISION_DEBUG("handle_decision: prepended %zu media markers", ctx_bitmaps.entries.size());
+                }
+                // If markers are already in the text, mtmd_tokenize will find and use them
+            }
+            contexts.push_back(ctx_text);
+            context_bitmaps.emplace_back(std::move(ctx_bitmaps));
+        }
+        if (!body.contains("schema")) {
+            throw std::invalid_argument("\"schema\" must be provided");
+        }
+        if (!decision_engine) {
+            DECISION_DEBUG("handle_decision: creating decision engine");
+            decision_engine = std::make_unique<llama_decision::engine>(ctx_tgt, (llama_seq_id) params_base.n_parallel,
+                                                                        params_base.n_seq_decision, mctx);
+        }
+        DECISION_DEBUG("handle_decision: compiling schema");
+        const auto cs = llama_decision::compile_schema(body.at("schema"), body.value("instructions", std::string()));
+        DECISION_DEBUG("handle_decision: rendering prompts");
+        std::string shared;
+        std::vector<std::string> dynamic;
+        for (const auto & c : contexts) {
+            auto [head, tail] = llama_decision::render_prompt(chat_params.tmpls.get(), chat_params.use_jinja, cs.system_text, c);
+            if (dynamic.empty()) {
+                shared = head;
+            } else if (head != shared) {
+                throw std::runtime_error("the chat template renders a different prefix per context");
+            }
+            dynamic.push_back(tail);
+        }
+        llama_decision::options opt;
+        opt.mode        = body.value("mode", std::string("auto"));
+        opt.tree_max    = (size_t) body.value("tree_max", 128);
+        opt.allow_cache = body.value("cache_prompt", true);
+
+        // If any context has images, pass the bitmaps through options for multimodal tokenization
+        opt.context_bitmaps = std::move(context_bitmaps);
+        const auto b = decision_engine->decide_batch(shared, dynamic, cs.inputs, opt);
+
+        size_t context_tokens = 0;
+        for (const auto & r : b.items) {
+            context_tokens += r.context_tokens;
+        }
+        json usage = json::object();
+        usage["prompt_tokens"]  = (long long) (b.shared_tokens + context_tokens);
+        usage["cached_tokens"]  = (long long) (b.cache_hit ? b.shared_tokens : 0);
+        usage["context_tokens"] = (long long) context_tokens;
+        usage["scored_rows"]    = b.rows;
+        json timings = json::object();
+        timings["prefill_ms"] = b.prefill_ms;
+        timings["scoring_ms"] = b.scoring_ms;
+        timings["total_ms"]   = b.prefill_ms + b.scoring_ms;
+        timings["rounds"]     = b.rounds;
+        timings["per_decision_ms"] = (b.prefill_ms + b.scoring_ms) / (double) b.items.size();
+
+        json results = json::array();
+        for (const auto & r : b.items) {
+            json item = llama_decision::assemble(cs, r);
+            item["usage"] = { { "context_tokens", (long long) r.context_tokens }, { "scored_rows", r.rows } };
+            results.push_back(item);
+        }
+        json out = json::object();
+        out["object"]  = "decision";
+        out["results"] = results;
+        out["model"]   = model_name;
+        out["created"] = (long long) std::time(nullptr);
+        out["usage"]   = usage;
+        out["timings"] = timings;
+        return out;
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -2946,6 +3111,21 @@ private:
             case SERVER_TASK_TYPE_NEXT_RESPONSE:
                 {
                     // do nothing
+                } break;
+            case SERVER_TASK_TYPE_DECISION:
+                {
+                    try {
+                        auto res  = std::make_unique<server_task_result_decision>();
+                        res->id   = task.id;
+                        res->data = handle_decision(task.decision_request);
+                        queue_results.send(std::move(res));
+                    } catch (const std::invalid_argument & e) {
+                        send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST);
+                    } catch (const common_json_error & e) {
+                        send_error(task, std::string("invalid decision request: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
+                    } catch (const std::exception & e) {
+                        send_error(task, e.what(), ERROR_TYPE_SERVER);
+                    }
                 } break;
             case SERVER_TASK_TYPE_METRICS:
                 {
@@ -5912,6 +6092,28 @@ void server_routes::init_routes() {
     this->post_embeddings_oai = [this](const server_http_req & req) {
         return handle_embeddings_impl(req, TASK_RESPONSE_TYPE_OAI_EMBD);
     };
+
+    this->post_decision = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+
+        server_task task(SERVER_TASK_TYPE_DECISION);
+        task.id               = res->rd.get_new_id();
+        task.decision_request = body;
+        res->rd.post_task(std::move(task));
+
+        auto result = res->rd.next([&] { return req.should_stop(); });
+        if (!result) {
+            return res; // the client went away
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
 
     this->post_rerank = [this](const server_http_req & req) {
         auto res = create_response();

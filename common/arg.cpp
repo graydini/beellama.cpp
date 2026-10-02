@@ -2875,6 +2875,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.n_parallel = value;
             }
         ).set_env("LLAMA_ARG_N_PARALLEL").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-seqs"}, "N",
+            string_format("sequences reserved for the /decision endpoint, above the slots; enables it (default: %d = disabled, minimum 3)", params.n_seq_decision),
+            [](common_params & params, int value) {
+                if (value != 0 && value < 3) {
+                    throw std::invalid_argument("--decision-seqs needs at least 3 (cached prefix, trunk, one branch)");
+                }
+                params.n_seq_decision = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_SEQS").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",
@@ -3123,6 +3133,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-cache-profile"}, "FNAME",
+        "routing profile CSV (from llama-moe-trace) used to pick which experts to cache in GPU memory\n"
+        "(requires --n-cpu-moe or --cpu-moe; see --moe-cache-slots)\n",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_profile = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PROFILE"));
+    add_opt(common_arg(
+        {"--moe-cache-slots"}, "N",
+        "number of routed experts per layer to keep resident in GPU memory (default: 0 = disabled)\n",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--moe-cache-slots must be >= 0");
+            }
+            params.moe_cache_slots = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_SLOTS"));
+    add_opt(common_arg(
+        {"--prefill-experts"}, "N",
+        "number of experts to use during prefill instead of the model value (default: model value)\n",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("--prefill-experts must be >= 1");
+            }
+            params.prefill_n_expert_used = value;
+        }
+    ).set_env("LLAMA_ARG_PREFILL_EXPERTS"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

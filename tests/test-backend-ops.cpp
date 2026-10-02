@@ -5136,6 +5136,46 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT_ID with a skewed ids distribution: one expert owns almost all
+// rows, so its row list spans many BN tiles and the last tile is partial.
+struct test_mul_mat_id_skew : public test_mul_mat_id {
+    const int hot_rows;
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + ",hot_rows=" + std::to_string(hot_rows);
+    }
+
+    test_mul_mat_id_skew(ggml_type type_a, ggml_type type_b, int n_mats, int n_used, bool bcast,
+            int64_t m, int64_t n, int64_t k, int hot_rows)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, bcast, m, n, k), hot_rows(hot_rows) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int n_slots = n_used * (int) n;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            // ids: [n_mats, n]; the graph uses the first n_used columns of each row
+            int pos = 0;
+            for (int64_t r = 0; r < t->ne[1]; r++) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (int64_t i = 0; i < t->ne[0] && i < n_used; i++, pos++) {
+                    data[i] = pos < hot_rows ? n_mats - 1 : (int) (i % (n_mats - 1));
+                }
+                for (int64_t i = n_used; i < t->ne[0]; i++) {
+                    data[i] = 0;
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+            GGML_ASSERT(pos == n_slots);
+        }
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -10361,6 +10401,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
+
+    // MUL_MAT_ID where one expert owns far more rows than a single BN tile, as produced
+    // by the MoE expert-cache packs. The last tile of such a row list is partial.
+    for (bool bcast : {false, true}) {
+        for (int n_mats : {9, 32, 256}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, n_mats, 8, bcast, 512, 128, 2048));
+        }
+    }
+    for (bool bcast : {true, false}) {
+        for (int hot_rows : {128, 129, 991}) {
+            test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_F16, GGML_TYPE_F32, 9, 8, bcast, 512, 128, 2048, hot_rows));
+        }
+    }
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));

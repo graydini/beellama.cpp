@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
@@ -178,45 +179,109 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
 
+        static const char * env_moe_skip = getenv("LLAMA_MOE_PREFILL_SKIP_LAYER");
+        static const char * env_moe_min_tok = getenv("LLAMA_MOE_PREFILL_SKIP_MIN_TOKENS");
+        static const char * env_moe_adaptive = getenv("LLAMA_MOE_PREFILL_ADAPTIVE");
+        const int skip_layer = env_moe_skip ? atoi(env_moe_skip) : 0;
+        const int min_tokens = env_moe_min_tok ? atoi(env_moe_min_tok) : 32;
+        int eff_skip_layer = skip_layer;
+        if (env_moe_adaptive && atoi(env_moe_adaptive) > 0 && skip_layer > 0) {
+            if (n_tokens < 256) {
+                // High-complexity / delicate boundary region: conservative preset (layer 32)
+                eff_skip_layer = std::max(skip_layer, 32);
+            }
+        }
+        static const char * env_kv_proj = getenv("LLAMA_MOE_KV_PROJECTOR");
+        const bool use_kv_proj = env_kv_proj && (strcmp(env_kv_proj, "0") != 0 && strcmp(env_kv_proj, "false") != 0 && strcmp(env_kv_proj, "off") != 0);
+
+        const bool is_skip_layer = (eff_skip_layer > 0 && il >= eff_skip_layer && n_tokens > min_tokens);
+
         ggml_tensor * inpSA = inpL;
 
-        cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
-        cb(cur, "attn_norm", il);
-
-        ggml_build_forward_expand(gf, cur);
-
-        // Determine layer type and build appropriate attention mechanism
-        if (hparams.is_recr(il)) {
-            // Linear attention layer (gated delta net)
-            cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+        if (is_skip_layer && use_kv_proj) {
+            // TRUE KV PROJECTOR: Bypasses O(N^2) self-attention matrix multiplication for prefill tokens.
+            // Synthesizes this layer's Keys and Values directly into ctx->kv_self using layer-specific QKV weights.
+            if (!hparams.is_recr(il)) {
+                build_projected_kv(inp->get_attn(), inpL, inp_pos, sections, il);
+            }
+            // Pass residual stream through attention stage
+            cur = inpSA;
         } else {
-            // Full attention layer
-            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
-        }
+            cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+            cb(cur, "attn_norm", il);
 
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
-            cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
-            inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
-        }
+            ggml_build_forward_expand(gf, cur);
 
-        // Residual connection
-        cur = ggml_add(ctx0, cur, inpSA);
-        cb(cur, "attn_residual", il);
+            // Determine layer type and build appropriate attention mechanism
+            if (hparams.is_recr(il)) {
+                // Linear attention layer (gated delta net)
+                cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+            } else {
+                // Full attention layer
+                cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+            }
+
+            if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+                cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            }
+
+            // Residual connection
+            cur = ggml_add(ctx0, cur, inpSA);
+            cb(cur, "attn_residual", il);
+        }
 
         // Save the tensor before post-attention norm for residual connection
         ggml_tensor * ffn_residual = cur;
 
-        // Post-attention norm
-        ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
-        cb(attn_post_norm, "attn_post_norm", il);
-
         // MOE FFN layer
-        cur = build_layer_ffn(attn_post_norm, il);
-        cb(cur, "ffn_out", il);
+        static const char * env_moe_proj = getenv("LLAMA_MOE_PROJECTOR_MODE");
+        const bool use_projector = (env_moe_proj && (strcmp(env_moe_proj, "shared") == 0 || strcmp(env_moe_proj, "1") == 0)) || use_kv_proj;
 
-        // Residual connection for FFN - add to the tensor from before post_attention_layernorm
-        cur = ggml_add(ctx0, cur, ffn_residual);
-        cb(cur, "post_moe", il);
+        static const char * env_exp_used = getenv("LLAMA_MOE_PREFILL_EXPERTS_USED");
+        const int prefill_experts_used = env_exp_used ? atoi(env_exp_used) : -1;
+
+        if (is_skip_layer) {
+            ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+            cb(attn_post_norm, "attn_post_norm", il);
+
+            if (prefill_experts_used >= 0) {
+                // Top-N Expert Sparsity: evaluate Shared Expert + N routed specialists (e.g. N=0, 2, 4, 6, 8)
+                ggml_tensor * ffn_out = build_layer_ffn(attn_post_norm, il, prefill_experts_used);
+                cur = ggml_add(ctx0, ffn_residual, ffn_out);
+                cb(cur, "ffn_sparse_moe", il);
+            } else if (use_projector) {
+                // Shared Base MoE Projector: compute non-linear Shared Base FFN (1.0x capacity)
+                // maintaining token representation geometry while bypassing the 8 heavy routed specialists
+                ggml_tensor * ffn_proj = build_layer_projector_ffn(attn_post_norm, il);
+
+                // MoE router gating modulation if moe_router mode is active
+                if (env_kv_proj && strcmp(env_kv_proj, "moe_router") == 0 && model.layers[il].ffn_gate_inp != nullptr) {
+                    ggml_tensor * r_logits = build_lora_mm(model.layers[il].ffn_gate_inp, attn_post_norm);
+                    ggml_tensor * r_probs  = ggml_soft_max(ctx0, r_logits);
+                    ggml_tensor * r_gate   = ggml_view_2d(ctx0, r_probs, 1, n_tokens, r_probs->nb[1], 0);
+                    ffn_proj = ggml_mul(ctx0, ffn_proj, r_gate);
+                }
+
+                cur = ggml_add(ctx0, ffn_residual, ffn_proj);
+                cb(cur, "ffn_proj_moe", il);
+            } else {
+                // Late-layer prefill skip: pass residual stream through to bypass heavy 8-expert MoE FFN.
+                cur = ffn_residual;
+                cb(cur, "ffn_skip_moe", il);
+            }
+        } else {
+            // Post-attention norm
+            ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+            cb(attn_post_norm, "attn_post_norm", il);
+
+            cur = build_layer_ffn(attn_post_norm, il);
+            cb(cur, "ffn_out", il);
+
+            // Residual connection for FFN - add to the tensor from before post_attention_layernorm
+            cur = ggml_add(ctx0, cur, ffn_residual);
+            cb(cur, "post_moe", il);
+        }
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
@@ -491,26 +556,32 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     return cur;
 }
 
-ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
+ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il, int n_experts_override) {
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    ggml_tensor * moe_out =
-        build_moe_ffn(cur,
-            model.layers[il].ffn_gate_inp,
-            model.layers[il].ffn_up_exps,
-            model.layers[il].ffn_gate_exps,
-            model.layers[il].ffn_down_exps,
-            nullptr,
-            n_expert, n_expert_used,
-            LLM_FFN_SILU, true,
-            hparams.expert_weights_scale,
-            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
-            model.layers[il].ffn_up_exps_s,
-            model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
-    cb(moe_out, "ffn_moe_out", il);
+    const int64_t actual_experts_used = (n_experts_override >= 0) ? n_experts_override : n_expert_used;
+
+    ggml_tensor * moe_out = nullptr;
+    if (actual_experts_used > 0) {
+        moe_out =
+            build_moe_ffn(cur,
+                model.layers[il].ffn_gate_inp,
+                model.layers[il].ffn_up_exps,
+                model.layers[il].ffn_gate_exps,
+                model.layers[il].ffn_down_exps,
+                nullptr,
+                n_expert, actual_experts_used,
+                LLM_FFN_SILU, true,
+                hparams.expert_weights_scale,
+                LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+                nullptr, model.layers[il].ffn_gate_up_exps,
+                model.layers[il].ffn_up_exps_s,
+                model.layers[il].ffn_gate_exps_s,
+                model.layers[il].ffn_down_exps_s,
+                nullptr, &model.layers[il]);
+        cb(moe_out, "ffn_moe_out", il);
+    }
 
     // Add shared experts if present - following Qwen3Next reference implementation
     if (model.layers[il].ffn_up_shexp != nullptr) {
@@ -533,18 +604,101 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
         shared_gate = ggml_sigmoid(ctx0, shared_gate);
         cb(shared_gate, "shared_expert_gate_sigmoid", il);
 
-
         // Apply the gate to the shared expert output
         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
         cb(ffn_shexp, "ffn_shexp_gated", il);
 
-        cur = ggml_add(ctx0, moe_out, ffn_shexp);
+        if (moe_out != nullptr) {
+            cur = ggml_add(ctx0, moe_out, ffn_shexp);
+        } else {
+            cur = ffn_shexp;
+        }
         cb(cur, "ffn_out", il);
     } else {
         cur = moe_out;
     }
 
+    GGML_ASSERT(cur != nullptr && "Cannot skip all experts if model has no shared expert");
+
     return cur;
+}
+
+ggml_tensor * llama_model_qwen35moe::graph::build_layer_projector_ffn(ggml_tensor * cur, const int il) {
+    // Shared-Base MoE Projector: compute non-linear Shared Base FFN (1.0x capacity)
+    // preserving token representation geometry while bypassing the 8 heavy routed specialists
+    if (model.layers[il].ffn_up_shexp != nullptr) {
+        ggml_tensor * ffn_shexp =
+            build_ffn(cur,
+                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+                NULL,
+                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(ffn_shexp, "ffn_shexp_proj", il);
+
+        ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+        cb(shared_gate, "shared_expert_gate_proj", il);
+
+        shared_gate = ggml_sigmoid(ctx0, shared_gate);
+        cb(shared_gate, "shared_expert_gate_sigmoid_proj", il);
+
+        ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
+        cb(ffn_shexp, "ffn_shexp_proj_gated", il);
+
+        return ffn_shexp;
+    }
+    return cur;
+}
+
+void llama_model_qwen35moe::graph::build_projected_kv(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             h_proj,
+        ggml_tensor *             inp_pos,
+        int *                     sections,
+        int                       target_layer) {
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+
+    // Normalize h_proj using target_layer's attn_norm (standard Transformer input normalization)
+    ggml_tensor * h_norm = build_norm(h_proj, model.layers[target_layer].attn_norm, nullptr, LLM_NORM_RMS, target_layer);
+    cb(h_norm, "h_norm_proj", target_layer);
+
+    // Qwen3.5 joint QKV projection from h_norm using target_layer's native projection weights
+    auto [Qcur_full, Kcur, Vcur] = build_qkv(model.layers[target_layer], h_norm,
+            n_embd_head * 2, n_head,
+            n_embd_head,     n_head_kv,
+            n_embd_head,     n_head_kv,
+            target_layer, false);
+    cb(Kcur, "Kcur_proj", target_layer);
+    cb(Vcur, "Vcur_proj", target_layer);
+
+    // Apply K normalization
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+    Kcur = build_norm(Kcur, model.layers[target_layer].attn_k_norm, nullptr, LLM_NORM_RMS, target_layer);
+    cb(Kcur, "Kcur_normed_proj", target_layer);
+
+    // Reshape V
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+    // Apply IMRoPE to K
+    Kcur = ggml_rope_multi(
+            ctx0, Kcur, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow
+            );
+    cb(Kcur, "Kcur_rope_proj", target_layer);
+
+    // Store directly into KV cache for target_layer
+    if (inp->self_k_rot) {
+        Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp->self_k_rot);
+    }
+    if (inp->self_v_rot) {
+        Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp->self_v_rot);
+    }
+
+    build_kv_store(inp->mctx, Kcur, Vcur,
+            inp->get_k_idxs(), inp->get_v_idxs(),
+            inp->self_tail_idxs, target_layer);
 }
 
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for Qwen3.5/3.6 MoE

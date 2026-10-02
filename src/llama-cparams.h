@@ -18,6 +18,7 @@ struct llama_cparams {
     uint32_t n_outputs_max_per_seq;
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
+    int32_t  prefill_n_expert_used = -1; // experts used during prefill, -1 = native n_expert_used
 
     int32_t  nextn_layer_offset = 0;
 
